@@ -17,6 +17,19 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
         checks.append({"name": "residual", "status": "fail", "detail": "target must be positive"})
     else:
         checks.append({"name": "residual", "status": "ok", "detail": "target set"})
+    target_status = rt.chlor_targets.status()
+    if target_status["state"] == "STALE":
+        checks.append(
+            {
+                "name": "targets",
+                "status": "warn",
+                "detail": f"config unreadable; holding last target {target_status['fingerprint']}",
+            }
+        )
+    elif rt.chlor_targets.current_target() <= 0:
+        checks.append({"name": "targets", "status": "fail", "detail": "no confirmed target"})
+    else:
+        checks.append({"name": "targets", "status": "ok", "detail": "segmented targets confirmed"})
     if rt.accumulator.value() < 0:
         checks.append({"name": "quota", "status": "fail", "detail": "accumulator is negative"})
     else:

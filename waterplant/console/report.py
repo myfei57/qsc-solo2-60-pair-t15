@@ -40,6 +40,9 @@ def text_report(rt: Runtime) -> str:
         f"backwash commands={rt.backwash.command_list()}",
         f"quota value={telemetry.quota_value:.4f} clearwell level={telemetry.clearwell_level:.4f}",
         f"coag ratio={telemetry.coag_ratio:.4f} chlorine target={telemetry.chlor_target:.4f}",
+        f"chlorine targets: {describe['chlor_targets']}",
+        f"chlorine active={rt.chlor_targets.active().band_id} "
+        f"values={rt.chlor_targets.active().values}",
         (
             f"ph value={telemetry.ph_value:.4f} stable={telemetry.ph_stable} "
             f"scheduled={telemetry.schedule_due}"

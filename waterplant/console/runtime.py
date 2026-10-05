@@ -5,6 +5,7 @@ from __future__ import annotations
 from waterplant.audit import Auditor
 from waterplant.backwash import Controller
 from waterplant.chlor import Doser as ChlorDoser
+from waterplant.chlor import TargetHolder
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
 from waterplant.filter import Bank
@@ -29,14 +30,16 @@ class Runtime:
         self.inlet = InletController()
         self.outlet = InletController()
         self.coag_doser = coag_doser
-        self.chlor_doser = ChlorDoser(store)
+        self.auditor = Auditor(store)
+        self.chlor_targets = TargetHolder(store, auditor=self.auditor)
+        self.chlor_targets.bootstrap()
+        self.chlor_doser = ChlorDoser(store, targets=self.chlor_targets)
         self.bank = bank
         self.backwash = Controller(bank, store)
         self.sampler = Sampler(coag_doser)
         self.calibration = Calibration(store)
-        self.well = Well(store)
+        self.well = Well(store, targets=self.chlor_targets)
         self.accumulator = Accumulator(store)
-        self.auditor = Auditor(store)
         self.stabilizer = Stabilizer(store)
         self.scheduler = Scheduler(store)
         self.trend = Trend(store)

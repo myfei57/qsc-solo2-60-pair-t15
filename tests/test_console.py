@@ -41,6 +41,7 @@ class ConsoleCase(unittest.TestCase):
             "store",
             "calibration",
             "residual",
+            "targets",
             "quota",
             "intake",
             "ph",
@@ -57,6 +58,7 @@ class ConsoleCase(unittest.TestCase):
                 "intake",
                 "coag",
                 "chlor",
+                "chlor_targets",
                 "filter",
                 "backwash",
                 "turbidity",
@@ -200,10 +202,10 @@ class ConsoleCase(unittest.TestCase):
         self.call("POST", "/coag/dose", {"flow": 5.0})
         self.call("POST", "/chlor/dose", {})
         status, body = self.call("GET", "/audit")
-        self.assertEqual(len(body["entries"]), 2)
+        self.assertEqual(len(body["entries"]), 3)
         status, body = self.call("GET", "/audit/summary")
-        self.assertEqual(body["count"], 2)
-        self.assertEqual(body["by_kind"], {"coagulant": 1, "chlorine": 1})
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(body["by_kind"], {"coagulant": 1, "chlorine": 1, "chlorine_dose_basis": 1})
         status, body = self.call("POST", "/audit/filter", {"kind": "chlorine"})
         self.assertEqual(len(body["entries"]), 1)
 
@@ -220,15 +222,19 @@ class ConsoleCase(unittest.TestCase):
                 "bed_id": "b1",
                 "zone": 1,
                 "amount": 12.0,
+                "minute": 420,
             },
         )
         self.assertEqual(status, 200)
         self.assertEqual(body["coag_dose"], 800.0)
         self.assertEqual(body["turb_dose"], 3.0)
-        self.assertEqual(body["chlor_dose"], 0.65)
+        # Morning peak band (360..540): plant outlet target is 0.60.
+        self.assertEqual(body["chlor_dose"], 0.6)
+        self.assertEqual(body["chlor_target"]["band_id"], "morning")
+        self.assertTrue(body["chlor_target"]["fingerprint"])
         self.assertEqual(body["rotation"], ["b1"])
         self.assertEqual(body["drains"], 1)
-        self.assertEqual(body["audit_count"], 2)
+        self.assertEqual(body["audit_count"], 4)
         self.assertTrue(body["ph_stable"])
         self.assertEqual(body["ph_adjustment"], 0.0)
 
@@ -296,7 +302,7 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("GET", "/audit/totals")
         self.assertEqual(status, 200)
         self.assertEqual(body["totals"]["coagulant"], 12.0)
-        self.assertEqual(body["totals"]["chlorine"], 0.5)
+        self.assertEqual(body["totals"]["chlorine"], 0.4)
 
     def test_inventory_and_metrics_routes(self) -> None:
         status, body = self.call("POST", "/inventory/receive", {"chemical": "chlorine", "lot_id": "L1", "amount": 40.0})
@@ -333,6 +339,127 @@ class ConsoleCase(unittest.TestCase):
         self.assertTrue(body["reset"])
         _, body = self.call("GET", "/metrics")
         self.assertEqual(body["requests"], 1)
+
+    def test_segmented_target_routes_and_boundary_timing(self) -> None:
+        status, body = self.call("GET", "/chlor/targets")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["unit"], "mg/L")
+        self.assertEqual(body["analyte"], "free_residual_chlorine")
+        self.assertEqual(body["switch_mode"], "boundary")
+        self.assertTrue(body["config"]["bands"])
+        self.assertEqual(body["active"]["band_id"], "night_a")
+        self.assertEqual(body["active"]["values"]["plant"], 0.4)
+
+        # Explicit switch at the 06:00 boundary promotes the morning band.
+        status, body = self.call("POST", "/chlor/targets/switch", {"minute": 360})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["changed"])
+        self.assertEqual(body["current"]["band_id"], "morning")
+        self.assertEqual(body["current"]["values"]["plant"], 0.6)
+        # Re-triggering at the same band is idempotent.
+        _, body = self.call("POST", "/chlor/targets/switch", {"minute": 400})
+        self.assertFalse(body["changed"])
+        # The dose follows the confirmed target, with the same basis.
+        _, body = self.call("POST", "/chlor/dose", {})
+        self.assertEqual(body["dose"], 0.6)
+        status, entries = self.call("GET", "/audit")
+        basis = [e for e in entries["entries"] if e["kind"] == "chlorine_dose_basis"][-1]
+        import json as _json
+
+        detail = _json.loads(basis["detail"])
+        self.assertEqual(detail["fingerprint"], detail["fingerprint"])
+        self.assertEqual(detail["band_id"], "morning")
+
+    def test_segmented_target_config_validation_and_stale_hold(self) -> None:
+        _, good = self.call("GET", "/chlor/targets/config")
+        # Overlapping bands are rejected, the running schedule is untouched.
+        bad = {
+            "mode": "boundary",
+            "bands": [
+                {"id": "a", "start": 0, "end": 120},
+                {"id": "b", "start": 100, "end": 1440},
+            ],
+            "zones": [
+                {"id": "plant", "order": 0},
+                {"id": "entry", "order": 1},
+                {"id": "farpoint", "order": 2},
+            ],
+            "targets": {
+                "a": {"plant": 0.4, "entry": 0.35, "farpoint": 0.3},
+                "b": {"plant": 0.4, "entry": 0.35, "farpoint": 0.3},
+            },
+        }
+        status, error = self.call("PUT", "/chlor/targets/config", bad)
+        self.assertEqual(status, 400)
+        self.assertIn("contiguous", error["error"])
+        _, still = self.call("GET", "/chlor/targets/config")
+        self.assertEqual(still["fingerprint"], good["fingerprint"])
+
+        # Corrupt config => partial failure: last target held, status STALE.
+        self.call("POST", "/chlor/targets/switch", {"minute": 360})
+        self.store.put("chlor:target-config", "{broken")
+        status, body = self.call("POST", "/chlor/targets/switch", {"minute": 700})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["stale"])
+        self.assertEqual(body["current"]["values"]["plant"], 0.6)
+        _, state = self.call("GET", "/chlor/targets")
+        self.assertEqual(state["status"]["state"], "STALE")
+        _, checks = self.call("GET", "/health/checks")
+        target_check = [c for c in checks["checks"] if c["name"] == "targets"][0]
+        self.assertEqual(target_check["status"], "warn")
+        # Restore: one recovery, idempotent after.
+        self.store.put(
+            "chlor:target-config", json.dumps(good, ensure_ascii=False)
+        )
+        status, body = self.call("POST", "/chlor/targets/switch", {"minute": 700})
+        self.assertFalse(body["stale"])
+        self.assertEqual(body["current"]["band_id"], "day")
+        _, body2 = self.call("POST", "/chlor/targets/switch", {"minute": 700})
+        self.assertFalse(body2["changed"])
+
+    def test_manual_override_endpoint(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/chlor/targets/override",
+            {"values": {"farpoint": 0.55}, "operator": "duty", "minute": 420,
+             "request_id": "x1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["current"]["values"]["farpoint"], 0.55)
+        self.assertEqual(body["current"]["sources"]["farpoint"], "override")
+        # Same request id is idempotent.
+        _, again = self.call(
+            "POST",
+            "/chlor/targets/override",
+            {"values": {"farpoint": 0.55}, "operator": "duty", "minute": 420,
+             "request_id": "x1"},
+        )
+        self.assertFalse(again["changed"])
+        # Clearing resumes the schedule for that zone.
+        _, cleared = self.call("POST", "/chlor/targets/override/clear", {"minute": 420})
+        self.assertEqual(cleared["current"]["values"]["farpoint"], 0.3)
+        self.assertEqual(cleared["current"]["sources"]["farpoint"], "schedule")
+
+    def test_immediate_mode_switches_at_cycle_start(self) -> None:
+        _, config = self.call("GET", "/chlor/targets/config")
+        config["mode"] = "immediate"
+        status, body = self.call("PUT", "/chlor/targets/config", config)
+        self.assertEqual(status, 200)
+        status, body = self.call(
+            "POST",
+            "/cycle",
+            {
+                "flow": 100.0,
+                "samples": [1.0],
+                "level": 5.0,
+                "zone": 1,
+                "amount": 1.0,
+                "minute": 700,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["chlor_target"]["band_id"], "day")
+        self.assertEqual(body["chlor_dose"], 0.5)
 
     def test_export_routes(self) -> None:
         self.call("POST", "/coag/dose", {"flow": 5.0})

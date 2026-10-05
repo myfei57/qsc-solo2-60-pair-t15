@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from waterplant.clearwell import Well
+import json
+
+from waterplant.chlor import TargetHolder, default_config
+from waterplant.chlor.target import CONFIG_KEY
 from waterplant.flow import Calibration
 from waterplant.intake import DEFAULT_WINDOW, WINDOW_KEY, FlowRepository, Trend
 from waterplant.ph import DEFAULT_PH, PH_KEY, Stabilizer
@@ -20,9 +23,12 @@ def seed_defaults(store: Store) -> None:
     if calibration.current() <= 0:
         calibration.replace(1.0)
 
-    well = Well(store)
-    if well.residual_target() <= 0:
-        well.set_residual_target(0.5)
+    if not has_key(store, CONFIG_KEY):
+        store.put(CONFIG_KEY, json.dumps(default_config().as_dict(), ensure_ascii=False))
+
+    # Confirm the first target matrix (00:00 baseline) so dosing never starts
+    # without one; bootstrap writes no audit entries.
+    TargetHolder(store).bootstrap()
 
     repository = FlowRepository(store)
     if not repository.load_flow()[1]:

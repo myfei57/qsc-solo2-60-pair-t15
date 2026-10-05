@@ -150,12 +150,18 @@ class DosingCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store.open(f"{tmp}/state.json")
             doser = ChlorDoser(store)
-            self.assertEqual(doser.current_target(), 0.5)
+            # Bootstrapped baseline is the 00:00 night plant outlet target.
+            self.assertEqual(doser.current_target(), 0.4)
             Well(store).update_residual_demand(1.0)
             self.assertEqual(doser.current_target(), 1.0)
             self.assertEqual(doser.apply_residual(), 1.0)
             self.assertEqual(doser.target_for_demand(0.0), 0.3)
             self.assertIn("chlorine", doser.describe())
+            # Dose and target carry the same measurement basis and snapshot.
+            state = doser.state()
+            self.assertEqual(state.target, state.dose)
+            self.assertEqual(state.unit, "mg/L")
+            self.assertTrue(state.fingerprint)
 
     def test_demand_validation(self) -> None:
         validate_demand(0.0)

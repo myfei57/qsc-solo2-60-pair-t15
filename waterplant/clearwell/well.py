@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from waterplant.chlor import ZONE_PLANT, TargetHolder
 from waterplant.intake import InletController
 from waterplant.store.epoch import load_float, save_float
 from waterplant.store.store import Store
@@ -16,8 +17,9 @@ DEFAULT_RESIDUAL_TARGET = 0.5
 class Well:
     """Holds the stored water level and the chlorine residual target."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, targets: TargetHolder | None = None) -> None:
         self._store = store
+        self._targets = targets or TargetHolder(store)
 
     def level(self) -> float:
         value, _ = load_float(self._store, LEVEL_KEY)
@@ -27,10 +29,23 @@ class Well:
         save_float(self._store, LEVEL_KEY, value)
 
     def residual_target(self) -> float:
-        value, present = load_float(self._store, RESIDUAL_KEY)
-        return value if present else DEFAULT_RESIDUAL_TARGET
+        """Confirmed plant outlet residual target (segmented schedule)."""
+
+        return self._targets.current_target(ZONE_PLANT)
 
     def set_residual_target(self, value: float) -> None:
+        """Force the plant outlet target as a manual override.
+
+        The override takes effect immediately and outranks the time schedule
+        until it is released; it is confirmed through the same handover path.
+        """
+
+        if value <= 0:
+            raise ValueError("residual target must be positive")
+        self._targets.bootstrap()
+        self._targets.set_override(
+            {ZONE_PLANT: value}, operator="clearwell", reason="set_residual_target"
+        )
         save_float(self._store, RESIDUAL_KEY, value)
 
     def update_residual_demand(self, demand: float) -> float:

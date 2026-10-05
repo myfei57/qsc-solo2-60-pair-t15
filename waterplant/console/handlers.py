@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from waterplant.chlor import validate_demand
+from waterplant.chlor.target import ConfigError
 from waterplant.clearwell import validate_level
 from waterplant.filter import validate_zone
 from waterplant.flow import calibrate_meter, validate_factor
@@ -23,7 +24,14 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import (
+    Request,
+    Response,
+    csv_response,
+    error_response,
+    json_response,
+    text_response,
+)
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -150,7 +158,64 @@ def chlor_target(server: "Server", request: Request) -> Response:
 
 
 def chlor_dose(server: "Server", request: Request) -> Response:
-    return json_response({"dose": server.runtime.chlor_doser.apply_residual()})
+    zone = request.str_field("zone", "plant")
+    return json_response(
+        {"dose": server.runtime.chlor_doser.apply_residual(zone), "zone": zone}
+    )
+
+
+def chlor_target_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.chlor_targets.state())
+
+
+def chlor_target_config_get(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.chlor_targets.config().as_dict())
+
+
+def chlor_target_config_put(server: "Server", request: Request) -> Response:
+    config = server.runtime.chlor_targets.replace_config(
+        request.payload, operator=request.str_field("operator", "operator")
+    )
+    return json_response(
+        {
+            "accepted": True,
+            "fingerprint": config.fingerprint,
+            "mode": config.mode,
+            "note": "config adopted; effective after the next confirmed handover",
+        }
+    )
+
+
+def chlor_target_switch(server: "Server", request: Request) -> Response:
+    minute = request.int_field("minute", -1)
+    result = server.runtime.chlor_targets.tick(
+        None if minute < 0 else minute,
+        reason=request.str_field("reason", "manual_switch"),
+    )
+    return json_response(result.as_dict())
+
+
+def chlor_target_override(server: "Server", request: Request) -> Response:
+    values = request.payload.get("values")
+    if not isinstance(values, dict) or not values:
+        return error_response(400, "field values must be an object of zone -> target")
+    numeric = {str(zone): float(value) for zone, value in values.items()}
+    result = server.runtime.chlor_targets.set_override(
+        numeric,
+        ttl_minutes=request.int_field("ttl_minutes", 0),
+        operator=request.str_field("operator", "operator"),
+        reason=request.str_field("reason", "manual override"),
+        minute=(None if "minute" not in request.payload else request.int_field("minute")),
+        request_id=request.str_field("request_id", ""),
+    )
+    return json_response(result.as_dict())
+
+
+def chlor_target_override_clear(server: "Server", request: Request) -> Response:
+    result = server.runtime.chlor_targets.clear_override(
+        None if "minute" not in request.payload else request.int_field("minute")
+    )
+    return json_response(result.as_dict())
 
 
 def clearwell_level(server: "Server", request: Request) -> Response:
