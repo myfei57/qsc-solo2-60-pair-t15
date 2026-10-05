@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Callable, Iterable
 
+from waterplant.chlor.targets import Moment
 from waterplant.store import Store
 
 from . import handlers
@@ -16,8 +17,12 @@ from .runtime import Runtime
 class Server:
     """Owns the runtime state and dispatches console requests."""
 
-    def __init__(self, store: Store) -> None:
-        self.runtime = Runtime(store)
+    def __init__(
+        self,
+        store: Store,
+        clock: Callable[[], Moment] = Moment.now,
+    ) -> None:
+        self.runtime = Runtime(store, clock)
         self.router = Router()
         self.metrics = Metrics()
         register_routes(self.router, handlers)

@@ -13,10 +13,27 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
         checks.append({"name": "calibration", "status": "fail", "detail": "factor must be positive"})
     else:
         checks.append({"name": "calibration", "status": "ok", "detail": "factor set"})
-    if rt.well.residual_target() <= 0:
+    status = rt.residual_targets.status()
+    active = status["active"]
+    upcoming = status["upcoming"]
+    if active["status"] == "stale" or status["schedule_error"]:
+        reason = active["reason"] or status["schedule_error"]
+        checks.append(
+            {
+                "name": "residual",
+                "status": "warn",
+                "detail": f"holding last target {active['target']:.4f}: {reason}",
+            }
+        )
+    elif active["target"] <= 0:
         checks.append({"name": "residual", "status": "fail", "detail": "target must be positive"})
     else:
-        checks.append({"name": "residual", "status": "ok", "detail": "target set"})
+        pending = " switch pending at cycle boundary" if status["switch_pending"] else ""
+        detail = (
+            f"target {active['target']:.4f} at {active['zone']} "
+            f"({active['status']}){pending}"
+        )
+        checks.append({"name": "residual", "status": "ok", "detail": detail})
     if rt.accumulator.value() < 0:
         checks.append({"name": "quota", "status": "fail", "detail": "accumulator is negative"})
     else:

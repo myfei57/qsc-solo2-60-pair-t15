@@ -57,6 +57,7 @@ class ConsoleCase(unittest.TestCase):
                 "intake",
                 "coag",
                 "chlor",
+                "residual_targets",
                 "filter",
                 "backwash",
                 "turbidity",
@@ -371,6 +372,166 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/filter/close", {"id": "ghost"})
         self.assertEqual(status, 400)
         self.assertIn("not found", body["error"])
+
+
+class ResidualTargetConsoleCase(ConsoleCase):
+    def _payload(self) -> dict:
+        return {
+            "dose_zone": "outlet",
+            "zones": [
+                {
+                    "zone": "outlet",
+                    "windows": [
+                        {"start": "06:00", "end": "22:00", "target": 0.55, "label": "day"},
+                        {"start": "22:00", "end": "06:00", "target": 0.35, "label": "night"},
+                    ],
+                },
+                {
+                    "zone": "network-end",
+                    "windows": [
+                        {"start": "06:00", "end": "22:00", "target": 0.4, "label": "day"},
+                        {"start": "22:00", "end": "06:00", "target": 0.25, "label": "night"},
+                    ],
+                },
+            ],
+        }
+
+    def test_status_defaults_to_legacy(self) -> None:
+        status, body = self.call("GET", "/chlor/targets")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["schedule"])
+        self.assertEqual(body["active"]["status"], "legacy")
+        self.assertIn("no schedule", body["active"]["reason"])
+
+    def test_install_then_dose_uses_segment_target(self) -> None:
+        status, body = self.call("POST", "/chlor/targets", self._payload())
+        self.assertEqual(status, 200)
+        self.assertTrue(body["installed"])
+        self.assertEqual(body["active"]["status"], "active")
+        self.assertEqual(body["active"]["zone"], "outlet")
+        self.assertIn("network-end", body["zones"])
+
+        status, body = self.call("GET", "/chlor/targets")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["schedule"]["switch_mode"], "cycle_boundary")
+        self.assertTrue(body["active"]["effective_at"])
+
+    def test_invalid_payload_is_rejected_and_explained(self) -> None:
+        bad = self._payload()
+        bad["zones"][0]["windows"][0]["end"] = "23:00"  # creates an overlap/gap
+        status, body = self.call("POST", "/chlor/targets", bad)
+        self.assertEqual(status, 400)
+        self.assertIn("windows", body["error"])
+
+    def test_demand_target_is_blocked_while_schedule_governs(self) -> None:
+        self.call("POST", "/chlor/targets", self._payload())
+        status, body = self.call("POST", "/chlor/target", {"demand": 1.0})
+        self.assertEqual(status, 409)
+        self.assertIn("segmented schedule", body["error"])
+
+    def test_recommended_schedule_installs(self) -> None:
+        status, body = self.call("POST", "/chlor/targets/recommended", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["schedule"]["dose_zone"], "outlet")
+        self.assertEqual(body["active"]["status"], "active")
+
+    def test_audit_trail_carries_target_change_and_effective_time(self) -> None:
+        self.call("POST", "/chlor/targets", self._payload())
+        status, body = self.call("POST", "/audit/filter", {"kind": "residual-target"})
+        self.assertEqual(status, 200)
+        events = [json.loads(entry["detail"])["event"] for entry in body["entries"]]
+        self.assertIn("installed", events)
+        self.assertIn("activated", events)
+        activated = [
+            json.loads(entry["detail"])
+            for entry in body["entries"]
+            if json.loads(entry["detail"])["event"] == "activated"
+        ][0]
+        self.assertEqual(activated["zone"], "outlet")
+        self.assertTrue(activated["effective_at"])
+
+    def test_stale_schedule_is_visible_in_health_checks(self) -> None:
+        self.call("POST", "/chlor/targets", self._payload())
+        # Corrupt the configured schedule directly in the persisted document.
+        raw = json.loads(self.store.get("chlor:residual-schedule")[0])
+        raw["zones"][0]["windows"][0]["target"] = -2.0
+        self.store.put("chlor:residual-schedule", json.dumps(raw))
+
+        # A read-only dashboard view flags the corruption before dosing runs.
+        status, body = self.call("GET", "/chlor/targets")
+        self.assertTrue(body["schedule_error"])
+
+        # The partial failure is detected at the cycle boundary / dose; the
+        # last confirmed target is then frozen and reported as stale.
+        self.call("POST", "/chlor/dose", {})
+        status, body = self.call("GET", "/chlor/targets")
+        self.assertEqual(body["active"]["status"], "stale")
+        self.assertTrue(body["active"]["target"] > 0)
+        self.assertTrue(body["schedule_error"])
+
+        status, body = self.call("GET", "/health/checks")
+        residual = [row for row in body["checks"] if row["name"] == "residual"][0]
+        self.assertEqual(residual["status"], "warn")
+        self.assertIn("holding last target", residual["detail"])
+
+    def test_repeated_install_is_idempotent(self) -> None:
+        payload = self._payload()
+        self.call("POST", "/chlor/targets", payload)
+        self.call("POST", "/chlor/targets", payload)
+        status, body = self.call("POST", "/audit/filter", {"kind": "residual-target"})
+        installs = [
+            entry for entry in body["entries"]
+            if json.loads(entry["detail"])["event"] == "installed"
+        ]
+        self.assertEqual(len(installs), 1)
+
+
+    def test_cycle_doses_against_segmented_target_not_demand(self) -> None:
+        from waterplant.chlor.targets import Moment
+        from waterplant.console.server import Server as _Server
+
+        holder = {"minute": 12 * 60}
+
+        def clock() -> Moment:
+            return Moment(day=1, minute=holder["minute"], iso="fixed")
+
+        server = _Server(self.store, clock)
+        call = lambda method, path, payload=None: self._call(server, method, path, payload)
+        call("POST", "/chlor/targets", self._payload())
+
+        # Noon is the day segment (0.55 day window in this payload starts 06:00).
+        body = call(
+            "POST",
+            "/cycle",
+            {
+                "flow": 800.0,
+                "samples": [2.0, 4.0],
+                "demand": 0.99,  # must be ignored while a schedule governs
+                "level": 10.0,
+                "bed_id": "",
+                "zone": 1,
+                "amount": 1.0,
+            },
+        )[1]
+        self.assertEqual(body["chlor_dose"], 0.55)
+        self.assertEqual(body["residual_target"]["status"], "active")
+        self.assertEqual(body["residual_target"]["window_start"], "06:00")
+
+        # Night segment at 23:00: same target holds for the whole cycle.
+        holder["minute"] = 23 * 60
+        body = call(
+            "POST",
+            "/cycle",
+            {"flow": 800.0, "samples": [], "demand": 0.99, "level": 10.0, "zone": 1, "amount": 1.0},
+        )[1]
+        self.assertEqual(body["chlor_dose"], 0.35)
+        self.assertEqual(body["residual_target"]["window_start"], "22:00")
+
+    @staticmethod
+    def _call(server, method: str, path: str, payload: dict | None = None):
+        response = server.dispatch(method, path, payload)
+        parsed = json.loads(response.body.decode("utf-8"))
+        return response.status, parsed
 
 
 class WsgiCase(unittest.TestCase):

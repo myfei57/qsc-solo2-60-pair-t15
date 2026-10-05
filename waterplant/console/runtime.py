@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from waterplant.audit import Auditor
 from waterplant.backwash import Controller
 from waterplant.chlor import Doser as ChlorDoser
+from waterplant.chlor.targets import Moment
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
 from waterplant.filter import Bank
@@ -21,7 +24,11 @@ from waterplant.turb import Sampler
 class Runtime:
     """Owns one instance of each control component for a single store."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(
+        self,
+        store: Store,
+        clock: Callable[[], Moment] = Moment.now,
+    ) -> None:
         bank = Bank()
         coag_doser = CoagDoser(store)
         self.store = store
@@ -29,7 +36,8 @@ class Runtime:
         self.inlet = InletController()
         self.outlet = InletController()
         self.coag_doser = coag_doser
-        self.chlor_doser = ChlorDoser(store)
+        self.chlor_doser = ChlorDoser(store, clock)
+        self.residual_targets = self.chlor_doser.targets
         self.bank = bank
         self.backwash = Controller(bank, store)
         self.sampler = Sampler(coag_doser)

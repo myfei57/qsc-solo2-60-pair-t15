@@ -2,34 +2,54 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from waterplant.audit import Auditor
 from waterplant.clearwell import Well
 from waterplant.store.store import Store
 
 from .report import ChlorState
+from .targets import Moment, ResidualTargets
 
 CHLORINE = "chlorine"
 
 
 class Doser:
-    """Follows the residual target held by the clear well."""
+    """Follows the residual target confirmed by the target manager.
 
-    def __init__(self, store: Store) -> None:
+    The manager is the single read path for a target: it resolves the
+    time/zone segment for the current cycle boundary, falls back to the clear
+    well target when no schedule is configured, and freezes on the last good
+    target when the configuration cannot be read. The dose always equals the
+    value the manager confirmed, so the target and the dosing口径 cannot drift.
+    """
+
+    def __init__(
+        self, store: Store, clock: Callable[[], Moment] = Moment.now
+    ) -> None:
         self._well = Well(store)
         self._auditor = Auditor(store)
+        self._targets = ResidualTargets(
+            store, self._auditor, self._well.residual_target, clock
+        )
+
+    @property
+    def targets(self) -> ResidualTargets:
+        return self._targets
 
     def current_target(self) -> float:
-        """Residual target read fresh from the clear well on every call."""
+        """Residual target confirmed for the current time, read on every call."""
 
-        return self._well.residual_target()
+        return self._targets.confirmed().target
 
     def dose_for_residual(self) -> float:
         return self.current_target()
 
     def apply_residual(self) -> float:
-        """Record a chlorine dose and return the amount applied."""
+        """Confirm the new target first, then record the dose it implies."""
 
-        dose = self.dose_for_residual()
+        activation = self._targets.refresh()
+        dose = activation.target
         self._auditor.record(CHLORINE, f"{dose:.4f}")
         return dose
 

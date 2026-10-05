@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from waterplant.chlor import validate_demand
+from waterplant.chlor.targets import recommended_schedule, schedule_fingerprint
 from waterplant.clearwell import validate_level
 from waterplant.filter import validate_zone
 from waterplant.flow import calibrate_meter, validate_factor
@@ -23,7 +24,7 @@ from . import simulate as simulate_module
 from . import snapshot as snapshot_module
 from . import telemetry as telemetry_module
 from .cycle import run_cycle
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .report import text_report
 from .routes import route_table
 from .system import system_payload
@@ -143,10 +144,59 @@ def flow_replace(server: "Server", request: Request) -> Response:
 
 
 def chlor_target(server: "Server", request: Request) -> Response:
+    targets = server.runtime.residual_targets
+    try:
+        if targets.installed() is not None:
+            raise RequestError(
+                409,
+                "residual target is governed by a segmented schedule; "
+                "update /chlor/targets instead",
+            )
+    except RequestError:
+        raise
+    except ValueError as exc:
+        raise RequestError(409, f"segmented schedule unreadable: {exc}") from exc
     demand = request.float_field("demand")
     validate_demand(demand)
     target = server.runtime.well.update_residual_demand(demand)
     return json_response({"target": target})
+
+
+def chlor_targets(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.residual_targets.status())
+
+
+def chlor_targets_install(server: "Server", request: Request) -> Response:
+    try:
+        schedule = server.runtime.residual_targets.install(request.payload)
+    except (ValueError, TypeError) as exc:
+        raise RequestError(400, str(exc)) from exc
+    activation = server.runtime.residual_targets.confirmed()
+    status = server.runtime.residual_targets.status()
+    return json_response(
+        {
+            "installed": True,
+            "fingerprint": schedule_fingerprint(schedule),
+            "schedule": schedule.as_dict(),
+            "active": activation.as_dict(),
+            "zones": status["zones"],
+        }
+    )
+
+
+def chlor_targets_recommended(server: "Server", request: Request) -> Response:
+    schedule = recommended_schedule()
+    server.runtime.residual_targets.install(schedule.as_dict())
+    activation = server.runtime.residual_targets.confirmed()
+    status = server.runtime.residual_targets.status()
+    return json_response(
+        {
+            "installed": True,
+            "schedule": schedule.as_dict(),
+            "active": activation.as_dict(),
+            "zones": status["zones"],
+        }
+    )
 
 
 def chlor_dose(server: "Server", request: Request) -> Response:

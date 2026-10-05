@@ -17,6 +17,7 @@ def collect(rt: Runtime) -> dict[str, str]:
         "intake": rt.flow_repository.describe(),
         "coag": rt.coag_doser.describe(),
         "chlor": rt.chlor_doser.describe(),
+        "residual_targets": rt.residual_targets.describe(),
         "filter": rt.bank.describe(),
         "backwash": rt.backwash.describe(),
         "turbidity": rt.sampler.describe(),
